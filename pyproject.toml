@@ -1,0 +1,39 @@
+[tool.poetry]
+name = "solo2"
+version = "0.1.0"
+description = "Python library and CLI for Solo 2 device management"
+authors = ["SoloKeys Team"]
+license = "GPL-3.0-only"
+readme = "README.md"
+packages = [
+    {include = "solo2", from = "src"},
+]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+fido2 = "^1.1.2"
+pyusb = "^1.2.1"
+pyscard = "^2.0.9"
+hidapi = {version = ">=0.14.0.post2", markers = "sys_platform == 'win32'"}
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.4.3"
+black = "^23.11.0"
+mypy = "^1.7.1"
+
+[tool.poetry.scripts]
+solo2 = "solo2.cli:main"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 88
+target-version = ['py310']
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
