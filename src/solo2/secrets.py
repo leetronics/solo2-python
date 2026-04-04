@@ -21,9 +21,17 @@ from .errors import (
 )
 
 PASSWORD_ONLY_PREFIX = "__solo_pw__:"
+HMAC_SLOT_NAMES = {
+    1: "HmacSlot1",
+    2: "HmacSlot2",
+}
+HMAC_SLOT_NUMBERS = tuple(sorted(HMAC_SLOT_NAMES))
+HMAC_SECRET_LENGTH = 20
+
+# Backward-compatible aliases for the common KeePassXC default.
 KEEPASSXC_HMAC_SLOT = 2
-KEEPASSXC_HMAC_NAME = "HmacSlot2"
-KEEPASSXC_HMAC_SECRET_LENGTH = 20
+KEEPASSXC_HMAC_NAME = HMAC_SLOT_NAMES[KEEPASSXC_HMAC_SLOT]
+KEEPASSXC_HMAC_SECRET_LENGTH = HMAC_SECRET_LENGTH
 
 
 def encode_password_only_label(name: str) -> bytes:
@@ -253,19 +261,19 @@ def normalize_hmac_secret(secret: bytes | bytearray | str) -> bytes:
         except Exception as exc:
             raise Solo2CommandError(f"Invalid HMAC secret: {exc}") from exc
 
-    if len(secret_bytes) != KEEPASSXC_HMAC_SECRET_LENGTH:
+    if len(secret_bytes) != HMAC_SECRET_LENGTH:
         raise Solo2CommandError(
-            f"KeePassXC HMAC secret must be exactly {KEEPASSXC_HMAC_SECRET_LENGTH} bytes"
+            f"HMAC secret must be exactly {HMAC_SECRET_LENGTH} bytes"
         )
     return secret_bytes
 
 
-def _keepassxc_hmac_name(slot: int) -> str:
-    if slot != KEEPASSXC_HMAC_SLOT:
-        raise Solo2CommandError(
-            f"Only KeePassXC-compatible HMAC slot {KEEPASSXC_HMAC_SLOT} is supported"
-        )
-    return KEEPASSXC_HMAC_NAME
+def _hmac_slot_name(slot: int) -> str:
+    try:
+        return HMAC_SLOT_NAMES[slot]
+    except KeyError as exc:
+        joined = ", ".join(str(number) for number in HMAC_SLOT_NUMBERS)
+        raise Solo2CommandError(f"Only HMAC slots {joined} are supported") from exc
 
 
 class SecretsSession:
@@ -496,10 +504,10 @@ class SecretsSession:
         return [self.serialize_credential(credential) for credential in self.list_credentials()]
 
     def list_hmac_slots(self) -> list[HmacSlotInfo]:
-        return [self.get_hmac_slot(KEEPASSXC_HMAC_SLOT)]
+        return [self.get_hmac_slot(slot) for slot in HMAC_SLOT_NUMBERS]
 
     def get_hmac_slot(self, slot: int = KEEPASSXC_HMAC_SLOT) -> HmacSlotInfo:
-        name = _keepassxc_hmac_name(slot)
+        name = _hmac_slot_name(slot)
         target = next(
             (
                 credential
@@ -519,7 +527,7 @@ class SecretsSession:
         )
 
     def generate_hmac_secret(self) -> bytes:
-        return os.urandom(KEEPASSXC_HMAC_SECRET_LENGTH)
+        return os.urandom(HMAC_SECRET_LENGTH)
 
     def configure_hmac_slot(
         self,
@@ -528,7 +536,7 @@ class SecretsSession:
         *,
         overwrite: bool = False,
     ) -> HmacSlotInfo:
-        name = _keepassxc_hmac_name(slot)
+        name = _hmac_slot_name(slot)
         secret_bytes = normalize_hmac_secret(secret)
         current = self.get_hmac_slot(slot)
         if current.configured and not overwrite:
@@ -542,7 +550,7 @@ class SecretsSession:
             id=name.encode("utf-8"),
             other=OtherKind.HMAC,
             algorithm=Algorithm.SHA1,
-            digits=KEEPASSXC_HMAC_SECRET_LENGTH,
+            digits=HMAC_SECRET_LENGTH,
             touch_required=False,
             protected=False,
             encrypted=False,
@@ -552,7 +560,7 @@ class SecretsSession:
         return self.get_hmac_slot(slot)
 
     def delete_hmac_slot(self, slot: int) -> None:
-        name = _keepassxc_hmac_name(slot)
+        name = _hmac_slot_name(slot)
         current = self.get_hmac_slot(slot)
         if not current.configured:
             raise Solo2CommandError(f"{name} is not configured")
@@ -733,8 +741,9 @@ class SecretsSession:
         self._send_apdu(SecretsAppProtocol.INS_VERIFY_CODE, data=bytes(payload))
 
     def calculate_hmac(self, slot: int, challenge: bytes) -> str:
-        if slot == KEEPASSXC_HMAC_SLOT and not self.get_hmac_slot(slot).configured:
-            raise Solo2CommandError(f"{KEEPASSXC_HMAC_NAME} is not configured")
+        slot_info = self.get_hmac_slot(slot)
+        if not slot_info.configured:
+            raise Solo2CommandError(f"{slot_info.name} is not configured")
         if len(challenge) > 63:
             raise Solo2CommandError("Challenge must be 63 bytes or shorter")
         padded = challenge + bytes([64 - len(challenge)]) * (64 - len(challenge))

@@ -22,8 +22,8 @@ from .provisioner import ProvisionerSession
 from .secrets import (
     Algorithm,
     Credential,
-    KEEPASSXC_HMAC_NAME,
     KEEPASSXC_HMAC_SLOT,
+    HMAC_SLOT_NAMES,
     OtpKind,
     SecretsSession,
     normalize_hmac_secret,
@@ -197,7 +197,7 @@ def cmd_secrets(args: argparse.Namespace):
     if args.secrets_cmd == "hmac-generate":
         secret = session.generate_hmac_secret()
         slot_info = session.configure_hmac_slot(
-            KEEPASSXC_HMAC_SLOT,
+            args.slot,
             secret,
             overwrite=args.force,
         )
@@ -210,7 +210,7 @@ def cmd_secrets(args: argparse.Namespace):
         }
     if args.secrets_cmd == "hmac-import":
         slot_info = session.configure_hmac_slot(
-            KEEPASSXC_HMAC_SLOT,
+            args.slot,
             normalize_hmac_secret(args.secret),
             overwrite=args.force,
         )
@@ -221,8 +221,8 @@ def cmd_secrets(args: argparse.Namespace):
             "configured": slot_info.configured,
         }
     if args.secrets_cmd == "hmac-remove":
-        _require_yes(args, f"Pass --yes to remove {KEEPASSXC_HMAC_NAME}.")
-        session.delete_hmac_slot(KEEPASSXC_HMAC_SLOT)
+        _require_yes(args, f"Pass --yes to remove {HMAC_SLOT_NAMES[args.slot]}.")
+        session.delete_hmac_slot(args.slot)
         return {"success": True}
     if args.secrets_cmd == "verify-pin":
         return session.verify_pin(args.pin_value)
@@ -400,25 +400,28 @@ def build_parser() -> argparse.ArgumentParser:
     reverse.set_defaults(func=cmd_secrets)
     secrets_sub.add_parser(
         "hmac-status",
-        help=f"show KeePassXC HMAC slot status ({KEEPASSXC_HMAC_NAME})",
+        help="show HMAC slot status",
     ).set_defaults(func=cmd_secrets)
     hmac_generate = secrets_sub.add_parser(
         "hmac-generate",
-        help=f"generate and program a new KeePassXC secret into {KEEPASSXC_HMAC_NAME}",
+        help="generate and program a new HMAC secret into a slot",
     )
+    hmac_generate.add_argument("--slot", type=int, choices=[1, 2], default=KEEPASSXC_HMAC_SLOT)
     hmac_generate.add_argument("--force", action="store_true")
     hmac_generate.set_defaults(func=cmd_secrets)
     hmac_import = secrets_sub.add_parser(
         "hmac-import",
-        help=f"import a hex/base32 KeePassXC secret into {KEEPASSXC_HMAC_NAME}",
+        help="import a hex/base32 HMAC secret into a slot",
     )
+    hmac_import.add_argument("--slot", type=int, choices=[1, 2], default=KEEPASSXC_HMAC_SLOT)
     hmac_import.add_argument("--secret", required=True)
     hmac_import.add_argument("--force", action="store_true")
     hmac_import.set_defaults(func=cmd_secrets)
     hmac_remove = secrets_sub.add_parser(
         "hmac-remove",
-        help=f"remove the configured KeePassXC secret from {KEEPASSXC_HMAC_NAME}",
+        help="remove the configured HMAC secret from a slot",
     )
+    hmac_remove.add_argument("--slot", type=int, choices=[1, 2], default=KEEPASSXC_HMAC_SLOT)
     hmac_remove.add_argument("--yes", action="store_true")
     hmac_remove.set_defaults(func=cmd_secrets)
     hmac = secrets_sub.add_parser(
