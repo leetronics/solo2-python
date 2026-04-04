@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import os
 import re
 import struct
 import time
@@ -19,6 +21,9 @@ from .errors import (
 )
 
 PASSWORD_ONLY_PREFIX = "__solo_pw__:"
+KEEPASSXC_HMAC_SLOT = 2
+KEEPASSXC_HMAC_NAME = "HmacSlot2"
+KEEPASSXC_HMAC_SECRET_LENGTH = 20
 
 
 def encode_password_only_label(name: str) -> bytes:
@@ -135,6 +140,17 @@ class SecretsAppStatus:
     max_credentials: int
 
 
+@dataclass
+class HmacSlotInfo:
+    """Status for the KeePassXC-compatible HMAC challenge-response slot."""
+
+    slot: int
+    name: str
+    configured: bool
+    touch_required: bool = False
+    pin_protected: bool = False
+
+
 class SecretsAppProtocol:
     """OATH protocol constants and helpers."""
 
@@ -213,6 +229,43 @@ def _algorithm_to_nibble(algorithm: Algorithm) -> int:
         Algorithm.SHA256: 0x02,
         Algorithm.SHA512: 0x03,
     }.get(algorithm, 0x01)
+
+
+def normalize_hmac_secret(secret: bytes | bytearray | str) -> bytes:
+    """Normalize a KeePassXC-compatible HMAC secret to 20 raw bytes."""
+
+    if isinstance(secret, (bytes, bytearray)):
+        secret_bytes = bytes(secret)
+    else:
+        compact = re.sub(r"[\s-]+", "", secret).strip()
+        if not compact:
+            raise Solo2CommandError("HMAC secret is required")
+        try:
+            if re.fullmatch(r"[0-9a-fA-F]+", compact):
+                if len(compact) % 2:
+                    raise Solo2CommandError("Hex HMAC secret must have an even number of characters")
+                secret_bytes = bytes.fromhex(compact)
+            else:
+                padding = "=" * ((8 - len(compact) % 8) % 8)
+                secret_bytes = base64.b32decode(compact.upper() + padding, casefold=True)
+        except Solo2CommandError:
+            raise
+        except Exception as exc:
+            raise Solo2CommandError(f"Invalid HMAC secret: {exc}") from exc
+
+    if len(secret_bytes) != KEEPASSXC_HMAC_SECRET_LENGTH:
+        raise Solo2CommandError(
+            f"KeePassXC HMAC secret must be exactly {KEEPASSXC_HMAC_SECRET_LENGTH} bytes"
+        )
+    return secret_bytes
+
+
+def _keepassxc_hmac_name(slot: int) -> str:
+    if slot != KEEPASSXC_HMAC_SLOT:
+        raise Solo2CommandError(
+            f"Only KeePassXC-compatible HMAC slot {KEEPASSXC_HMAC_SLOT} is supported"
+        )
+    return KEEPASSXC_HMAC_NAME
 
 
 class SecretsSession:
@@ -442,6 +495,69 @@ class SecretsSession:
     def list_credentials_dicts(self) -> list[dict]:
         return [self.serialize_credential(credential) for credential in self.list_credentials()]
 
+    def list_hmac_slots(self) -> list[HmacSlotInfo]:
+        return [self.get_hmac_slot(KEEPASSXC_HMAC_SLOT)]
+
+    def get_hmac_slot(self, slot: int = KEEPASSXC_HMAC_SLOT) -> HmacSlotInfo:
+        name = _keepassxc_hmac_name(slot)
+        target = next(
+            (
+                credential
+                for credential in self.list_credentials()
+                if credential.other == OtherKind.HMAC and credential.name == name
+            ),
+            None,
+        )
+        if target is None:
+            return HmacSlotInfo(slot=slot, name=name, configured=False)
+        return HmacSlotInfo(
+            slot=slot,
+            name=name,
+            configured=True,
+            touch_required=target.touch_required,
+            pin_protected=target.protected,
+        )
+
+    def generate_hmac_secret(self) -> bytes:
+        return os.urandom(KEEPASSXC_HMAC_SECRET_LENGTH)
+
+    def configure_hmac_slot(
+        self,
+        slot: int,
+        secret: bytes | bytearray | str,
+        *,
+        overwrite: bool = False,
+    ) -> HmacSlotInfo:
+        name = _keepassxc_hmac_name(slot)
+        secret_bytes = normalize_hmac_secret(secret)
+        current = self.get_hmac_slot(slot)
+        if current.configured and not overwrite:
+            raise Solo2CommandError(
+                f"{name} is already configured; pass overwrite=True to replace it"
+            )
+        if current.configured:
+            self.delete_hmac_slot(slot)
+
+        credential = Credential(
+            id=name.encode("utf-8"),
+            other=OtherKind.HMAC,
+            algorithm=Algorithm.SHA1,
+            digits=KEEPASSXC_HMAC_SECRET_LENGTH,
+            touch_required=False,
+            protected=False,
+            encrypted=False,
+            has_password_safe=False,
+        )
+        self.add_credential(credential, secret_bytes)
+        return self.get_hmac_slot(slot)
+
+    def delete_hmac_slot(self, slot: int) -> None:
+        name = _keepassxc_hmac_name(slot)
+        current = self.get_hmac_slot(slot)
+        if not current.configured:
+            raise Solo2CommandError(f"{name} is not configured")
+        self.delete_credential(name)
+
     def add_credential(self, credential: Credential, secret: bytes) -> None:
         payload = bytearray()
         payload.extend(self._build_tlv(SecretsAppProtocol.TAG_NAME, credential.id))
@@ -617,6 +733,8 @@ class SecretsSession:
         self._send_apdu(SecretsAppProtocol.INS_VERIFY_CODE, data=bytes(payload))
 
     def calculate_hmac(self, slot: int, challenge: bytes) -> str:
+        if slot == KEEPASSXC_HMAC_SLOT and not self.get_hmac_slot(slot).configured:
+            raise Solo2CommandError(f"{KEEPASSXC_HMAC_NAME} is not configured")
         if len(challenge) > 63:
             raise Solo2CommandError("Challenge must be 63 bytes or shorter")
         padded = challenge + bytes([64 - len(challenge)]) * (64 - len(challenge))

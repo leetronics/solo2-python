@@ -19,7 +19,15 @@ from .errors import (
 )
 from .fido2 import Fido2Session
 from .provisioner import ProvisionerSession
-from .secrets import Algorithm, Credential, OtpKind, SecretsSession
+from .secrets import (
+    Algorithm,
+    Credential,
+    KEEPASSXC_HMAC_NAME,
+    KEEPASSXC_HMAC_SLOT,
+    OtpKind,
+    SecretsSession,
+    normalize_hmac_secret,
+)
 
 
 def _serialize(value: Any) -> Any:
@@ -184,6 +192,38 @@ def cmd_secrets(args: argparse.Namespace):
         return session.get_status()
     if args.secrets_cmd == "list":
         return session.list_credentials_dicts()
+    if args.secrets_cmd == "hmac-status":
+        return session.list_hmac_slots()
+    if args.secrets_cmd == "hmac-generate":
+        secret = session.generate_hmac_secret()
+        slot_info = session.configure_hmac_slot(
+            KEEPASSXC_HMAC_SLOT,
+            secret,
+            overwrite=args.force,
+        )
+        return {
+            "success": True,
+            "slot": slot_info.slot,
+            "name": slot_info.name,
+            "configured": slot_info.configured,
+            "secret_hex": secret.hex(),
+        }
+    if args.secrets_cmd == "hmac-import":
+        slot_info = session.configure_hmac_slot(
+            KEEPASSXC_HMAC_SLOT,
+            normalize_hmac_secret(args.secret),
+            overwrite=args.force,
+        )
+        return {
+            "success": True,
+            "slot": slot_info.slot,
+            "name": slot_info.name,
+            "configured": slot_info.configured,
+        }
+    if args.secrets_cmd == "hmac-remove":
+        _require_yes(args, f"Pass --yes to remove {KEEPASSXC_HMAC_NAME}.")
+        session.delete_hmac_slot(KEEPASSXC_HMAC_SLOT)
+        return {"success": True}
     if args.secrets_cmd == "verify-pin":
         return session.verify_pin(args.pin_value)
     if args.secrets_cmd == "set-pin":
@@ -234,7 +274,10 @@ def cmd_secrets(args: argparse.Namespace):
         session.verify_reverse_hotp(credential, args.code)
         return {"success": True}
     if args.secrets_cmd == "hmac":
-        return {"hmac": session.calculate_hmac(args.slot, args.challenge.encode("utf-8"))}
+        return {
+            "slot": args.slot,
+            "hmac": session.calculate_hmac(args.slot, args.challenge.encode("utf-8")),
+        }
     raise Solo2Error(f"Unknown secrets command: {args.secrets_cmd}")
 
 
@@ -355,9 +398,35 @@ def build_parser() -> argparse.ArgumentParser:
     reverse.add_argument("name")
     reverse.add_argument("code")
     reverse.set_defaults(func=cmd_secrets)
-    hmac = secrets_sub.add_parser("hmac")
+    secrets_sub.add_parser(
+        "hmac-status",
+        help=f"show KeePassXC HMAC slot status ({KEEPASSXC_HMAC_NAME})",
+    ).set_defaults(func=cmd_secrets)
+    hmac_generate = secrets_sub.add_parser(
+        "hmac-generate",
+        help=f"generate and program a new KeePassXC secret into {KEEPASSXC_HMAC_NAME}",
+    )
+    hmac_generate.add_argument("--force", action="store_true")
+    hmac_generate.set_defaults(func=cmd_secrets)
+    hmac_import = secrets_sub.add_parser(
+        "hmac-import",
+        help=f"import a hex/base32 KeePassXC secret into {KEEPASSXC_HMAC_NAME}",
+    )
+    hmac_import.add_argument("--secret", required=True)
+    hmac_import.add_argument("--force", action="store_true")
+    hmac_import.set_defaults(func=cmd_secrets)
+    hmac_remove = secrets_sub.add_parser(
+        "hmac-remove",
+        help=f"remove the configured KeePassXC secret from {KEEPASSXC_HMAC_NAME}",
+    )
+    hmac_remove.add_argument("--yes", action="store_true")
+    hmac_remove.set_defaults(func=cmd_secrets)
+    hmac = secrets_sub.add_parser(
+        "hmac",
+        help="calculate an HMAC challenge-response using the configured slot",
+    )
     hmac.add_argument("challenge")
-    hmac.add_argument("--slot", type=int, choices=[1, 2], default=1)
+    hmac.add_argument("--slot", type=int, choices=[1, 2], default=KEEPASSXC_HMAC_SLOT)
     hmac.set_defaults(func=cmd_secrets)
 
     provision_parser = subparsers.add_parser("provisioner", help="provisioner app operations")

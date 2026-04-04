@@ -1,5 +1,6 @@
 """Core Solo 2 device library, standalone package and CLI."""
 
+from .bootloader import BootloaderError, BootloaderSession
 from .clients import Solo2AdminClient, Solo2FidoClient, Solo2SecretsClient
 from .admin import AdminCommand, AdminSession, DeviceDiagnostics, RebootMode
 from .device import (
@@ -31,6 +32,10 @@ from .provisioner import GeneratedKey, ProvisionerSession
 from .secrets import (
     Algorithm,
     Credential,
+    HmacSlotInfo,
+    KEEPASSXC_HMAC_NAME,
+    KEEPASSXC_HMAC_SECRET_LENGTH,
+    KEEPASSXC_HMAC_SLOT,
     OATHBridge,
     OATHError,
     OATHPINRequired,
@@ -43,11 +48,14 @@ from .secrets import (
     SecretsSession,
     encode_password_only_label,
     is_password_only_label,
+    normalize_hmac_secret,
     strip_password_only_label,
 )
 
 __all__ = [
     "AdminCommand",
+    "BootloaderError",
+    "BootloaderSession",
     "AdminSession",
     "Algorithm",
     "Credential",
@@ -62,6 +70,10 @@ __all__ = [
     "Fido2PinStatus",
     "Fido2Session",
     "GeneratedKey",
+    "HmacSlotInfo",
+    "KEEPASSXC_HMAC_NAME",
+    "KEEPASSXC_HMAC_SECRET_LENGTH",
+    "KEEPASSXC_HMAC_SLOT",
     "OATHBridge",
     "OATHError",
     "OATHPINRequired",
@@ -96,5 +108,6 @@ __all__ = [
     "should_prefer_ccid",
     "encode_password_only_label",
     "is_password_only_label",
+    "normalize_hmac_secret",
     "strip_password_only_label",
 ]
