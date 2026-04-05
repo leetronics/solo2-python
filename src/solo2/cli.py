@@ -4,20 +4,25 @@ from __future__ import annotations
 
 import argparse
 import base64
+import getpass
 import json
 import sys
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any
 
 from .admin import AdminSession, RebootMode
-from .discovery import list_descriptors, list_regular_descriptors, open_device
+from .device import DeviceMode, Solo2Descriptor, Solo2Device, format_firmware_full, format_firmware_version
+from .discovery import list_bootloader_descriptors, list_regular_descriptors, open_device
 from .errors import (
     Solo2ConfirmationRequiredError,
     Solo2Error,
     Solo2NotFoundError,
+    Solo2PinRequiredError,
 )
 from .fido2 import Fido2Session
+from .hid_backend import list_ctap_hid_descriptors
+from .pcsc import list_pcsc_descriptors
 from .provisioner import ProvisionerSession
 from .secrets import (
     Algorithm,
@@ -30,7 +35,31 @@ from .secrets import (
 )
 
 
+@dataclass(frozen=True)
+class CliResult:
+    human: Any
+    data: Any
+
+
+@dataclass(frozen=True)
+class DeviceSummary:
+    kind: str
+    display: str
+    id: str
+    mode: str
+    uuid: str | None = None
+    transports: list[str] | None = None
+    transport_summary: str | None = None
+    firmware_version: str | None = None
+    locked: bool | None = None
+    variant: str | None = None
+    path: str | None = None
+    capabilities: list[str] | None = None
+
+
 def _serialize(value: Any) -> Any:
+    if isinstance(value, CliResult):
+        return _serialize(value.data)
     if isinstance(value, bytes):
         try:
             return value.decode("utf-8")
@@ -50,23 +79,203 @@ def _serialize(value: Any) -> Any:
 
 
 def _print_result(result: Any, as_json: bool) -> None:
+    if not as_json and isinstance(result, CliResult):
+        if result.human is None:
+            return
+        _print_human(result.human)
+        return
     serialized = _serialize(result)
     if as_json:
         print(json.dumps(serialized, indent=2, sort_keys=True))
         return
     if serialized is None:
         return
-    if isinstance(serialized, list):
-        for item in serialized:
-            if isinstance(item, dict):
-                print(json.dumps(item, indent=2, sort_keys=True))
+    _print_human(serialized)
+
+
+def _print_human(value: Any, indent: int = 0) -> None:
+    prefix = " " * indent
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(item, (dict, list)):
+                print(f"{prefix}{key}:")
+                _print_human(item, indent + 2)
             else:
-                print(item)
+                print(f"{prefix}{key}: {item}")
         return
-    if isinstance(serialized, dict):
-        print(json.dumps(serialized, indent=2, sort_keys=True))
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            if index and isinstance(item, (dict, list)):
+                print()
+            _print_human(item, indent)
         return
-    print(serialized)
+    print(f"{prefix}{value}")
+
+
+def _compact_dict(**items: Any) -> dict[str, Any]:
+    return {key: value for key, value in items.items() if value is not None}
+
+
+def _uuid_simple(uuid: str | None) -> str | None:
+    if not uuid:
+        return None
+    return uuid.replace("-", "").upper()
+
+
+def _transport_label(transport: str) -> str:
+    if transport == "hid":
+        return "CTAP"
+    if transport == "ccid":
+        return "PCSC"
+    return transport.upper()
+
+
+def _transport_summary(transports: set[str]) -> str:
+    if transports == {"CTAP", "PCSC"}:
+        return "CTAP+PCSC"
+    if transports == {"CTAP"}:
+        return "CTAP only"
+    if transports == {"PCSC"}:
+        return "PCSC only"
+    return "+".join(sorted(transports))
+
+
+def _locked_from_variant(variant: str | None) -> bool | None:
+    if variant == "Secure":
+        return True
+    if variant == "Hacker":
+        return False
+    return None
+
+
+def _regular_display(
+    *,
+    uuid: str | None,
+    transports: set[str],
+    firmware_version: str | None,
+    locked: bool | None,
+    fallback_id: str,
+) -> str:
+    transport_text = _transport_summary(transports)
+    lock_status = ""
+    if locked is True:
+        lock_status = ", locked"
+    elif locked is False:
+        lock_status = ", unlocked"
+    return (
+        f"Solo 2 {_uuid_simple(uuid) or fallback_id} "
+        f"({transport_text}, firmware {format_firmware_version(firmware_version)}{lock_status})"
+    )
+
+
+def _build_hid_descriptor(raw_descriptor) -> Solo2Descriptor:
+    descriptor_id = f"hid:{raw_descriptor.path!r}"
+    return Solo2Descriptor(
+        id=descriptor_id,
+        mode=DeviceMode.REGULAR,
+        path=descriptor_id,
+        transport="hid",
+        hid_path=raw_descriptor.path,
+    )
+
+
+def _build_pcsc_descriptor(reader_name: str) -> Solo2Descriptor:
+    descriptor_id = f"ccid:{reader_name}"
+    return Solo2Descriptor(
+        id=descriptor_id,
+        mode=DeviceMode.REGULAR,
+        path=descriptor_id,
+        transport="ccid",
+        reader_name=reader_name,
+    )
+
+
+def _list_device_summaries() -> list[DeviceSummary]:
+    regular_inventory: dict[str, dict[str, Any]] = {}
+
+    regular_descriptors = [_build_hid_descriptor(descriptor) for descriptor in list_ctap_hid_descriptors()]
+    regular_descriptors.extend(
+        _build_pcsc_descriptor(descriptor.reader) for descriptor in list_pcsc_descriptors()
+    )
+
+    for descriptor in regular_descriptors:
+        device = Solo2Device.from_descriptor(descriptor)
+        if not device.connect():
+            continue
+        try:
+            key = device.device_uuid or descriptor.id
+            entry = regular_inventory.setdefault(
+                key,
+                {
+                    "id": device.path,
+                    "uuid": device.device_uuid,
+                    "mode": DeviceMode.REGULAR.value,
+                    "path": device.path,
+                    "firmware_version": device.firmware_version,
+                    "variant": device.variant or None,
+                    "locked": _locked_from_variant(device.variant),
+                    "transports": set(),
+                    "capabilities": set(device.get_info().capabilities or []),
+                },
+            )
+            entry["transports"].add(_transport_label(descriptor.transport))
+            if device.device_uuid and not entry["uuid"]:
+                entry["uuid"] = device.device_uuid
+                entry["id"] = device.path
+                entry["path"] = device.path
+            if device.firmware_version and not entry["firmware_version"]:
+                entry["firmware_version"] = device.firmware_version
+            if device.variant and not entry["variant"]:
+                entry["variant"] = device.variant
+            locked = _locked_from_variant(device.variant)
+            if locked is not None and entry["locked"] is None:
+                entry["locked"] = locked
+            entry["capabilities"].update(device.get_info().capabilities or [])
+        finally:
+            device.disconnect()
+
+    summaries = [
+        DeviceSummary(
+            kind="solo2",
+            display=_regular_display(
+                uuid=entry["uuid"],
+                transports=entry["transports"],
+                firmware_version=entry["firmware_version"],
+                locked=entry["locked"],
+                fallback_id=entry["id"],
+            ),
+            id=entry["id"],
+            mode=entry["mode"],
+            uuid=entry["uuid"],
+            transports=sorted(entry["transports"]),
+            transport_summary=_transport_summary(entry["transports"]),
+            firmware_version=entry["firmware_version"],
+            locked=entry["locked"],
+            variant=entry["variant"],
+            path=entry["path"],
+            capabilities=sorted(entry["capabilities"]) or None,
+        )
+        for entry in regular_inventory.values()
+    ]
+
+    for descriptor in list_bootloader_descriptors():
+        summaries.append(
+            DeviceSummary(
+                kind="bootloader",
+                display=f"LPC 55 {descriptor.id}",
+                id=descriptor.id,
+                mode=descriptor.mode.value,
+                path=descriptor.path,
+            )
+        )
+
+    return sorted(
+        summaries,
+        key=lambda item: (
+            0 if item.kind == "bootloader" else 1,
+            item.uuid or item.id,
+        ),
+    )
 
 
 def _select_device(device_id: str | None):
@@ -86,35 +295,87 @@ def _require_yes(args: argparse.Namespace, message: str) -> None:
         raise Solo2ConfirmationRequiredError(message)
 
 
+def _resolve_fido2_pin(
+    args: argparse.Namespace,
+    session: Fido2Session,
+    *,
+    required: bool,
+) -> str | None:
+    if getattr(args, "pin", None):
+        return args.pin
+    if not required:
+        return None
+
+    status = session.get_pin_status()
+    if not status.pin_set:
+        return None
+    if not sys.stdin.isatty():
+        raise Solo2PinRequiredError("PIN required; pass --pin in non-interactive mode")
+
+    pin = getpass.getpass("Enter FIDO2 PIN: ")
+    if not pin:
+        raise Solo2PinRequiredError("PIN required")
+    args.pin = pin
+    session.set_pin_value(pin)
+    return pin
+
+
 def cmd_list(_args: argparse.Namespace):
-    return [
-        {
-            "id": descriptor.id,
-            "mode": descriptor.mode.value,
-            "transport": descriptor.transport,
-            "path": descriptor.path,
-            "firmware_version": descriptor.firmware_version,
-            "uuid": descriptor.uuid,
-        }
-        for descriptor in list_descriptors()
-    ]
+    summaries = _list_device_summaries()
+    return CliResult(
+        human=[summary.display for summary in summaries],
+        data=summaries,
+    )
 
 
 def cmd_info(args: argparse.Namespace):
     device = _select_device(args.device)
     info = device.get_info()
-    return {
-        "path": info.path,
-        "mode": info.mode.value,
-        "firmware_version": info.firmware_version,
-        "serial_number": info.serial_number,
-        "capabilities": info.capabilities,
-        "descriptor": {
-            "id": device.descriptor.id,
-            "transport": device.descriptor.transport,
-            "uuid": device.descriptor.uuid,
-        },
-    }
+    inventory_summary = next(
+        (
+            summary
+            for summary in _list_device_summaries()
+            if summary.kind == "solo2"
+            and (
+                summary.id == device.descriptor.id
+                or (summary.uuid and summary.uuid == device.device_uuid)
+                or summary.path == info.path
+            )
+        ),
+        None,
+    )
+    transports = set(inventory_summary.transports or []) if inventory_summary else {_transport_label(device.descriptor.transport)}
+    locked = inventory_summary.locked if inventory_summary else _locked_from_variant(device.variant)
+    summary = _regular_display(
+        uuid=device.device_uuid,
+        transports=transports,
+        firmware_version=device.firmware_version,
+        locked=locked,
+        fallback_id=device.descriptor.id,
+    )
+    data = _compact_dict(
+        display=summary,
+        id=device.descriptor.id,
+        path=info.path,
+        mode=info.mode.value,
+        uuid=device.device_uuid,
+        variant=device.variant or None,
+        transport_summary=_transport_summary(transports),
+        transports=sorted(transports),
+        firmware_version=device.firmware_version,
+        firmware=format_firmware_full(device.firmware_version),
+        locked=locked,
+        serial_number=info.serial_number,
+        capabilities=info.capabilities,
+    )
+    human = [summary]
+    if data.get("variant"):
+        human.append(f"variant: {data['variant']}")
+    human.append(f"id: {data['id']}")
+    human.append(f"path: {data['path']}")
+    if data.get("capabilities"):
+        human.append(f"capabilities: {', '.join(data['capabilities'])}")
+    return CliResult(human=human, data=data)
 
 
 def cmd_admin(args: argparse.Namespace):
@@ -141,8 +402,12 @@ def cmd_fido2(args: argparse.Namespace):
     session = Fido2Session(_select_device(args.device), pin=args.pin)
     if args.fido_cmd == "pin-status":
         return session.get_pin_status()
+    if args.fido_cmd in {"list", "delete", "rename"}:
+        pin = _resolve_fido2_pin(args, session, required=True)
+    else:
+        pin = args.pin
     if args.fido_cmd == "list":
-        return session.list_credentials(pin=args.pin)
+        return session.list_credentials(pin=pin)
     if args.fido_cmd == "set-pin":
         _require_yes(args, "Pass --yes to set a new FIDO2 PIN.")
         session.set_pin(args.new_pin)
@@ -151,7 +416,7 @@ def cmd_fido2(args: argparse.Namespace):
         _require_yes(args, "Pass --yes to change the FIDO2 PIN.")
         session.change_pin(args.current_pin, args.new_pin)
         return {"success": True}
-    credentials = session.list_credentials(pin=args.pin)
+    credentials = session.list_credentials(pin=pin)
     target = next(
         (
             credential
@@ -165,10 +430,10 @@ def cmd_fido2(args: argparse.Namespace):
         raise Solo2Error(f"Credential not found: {args.credential_id}")
     if args.fido_cmd == "delete":
         _require_yes(args, "Pass --yes to delete the FIDO2 credential.")
-        session.delete_credential(target, pin=args.pin)
+        session.delete_credential(target, pin=pin)
         return {"success": True}
     if args.fido_cmd == "rename":
-        session.rename_credential(target, args.new_name, pin=args.pin)
+        session.rename_credential(target, args.new_name, pin=pin)
         return {"success": True}
     raise Solo2Error(f"Unknown FIDO2 command: {args.fido_cmd}")
 
