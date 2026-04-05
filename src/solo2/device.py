@@ -223,19 +223,28 @@ class Solo2Device(SoloDevice):
                 desc = matched_hid.descriptor
                 version = self._get_firmware_version_from_hid(matched_hid)
                 device_uuid = self._get_uuid_from_hid(matched_hid)
-                variant = ""
                 ctap_info = None
+
+                # locked() reads the hardware Secure Boot seal — always reliable
+                locked = self._get_locked_from_hid(matched_hid)
+                variant = self._variant_from_locked(locked)
+
+                # AAGUID only for cross-check (requires provisioned attestation cert)
                 try:
                     ctap = Ctap2(matched_hid)
                     ctap_info = ctap.info
                     aaguid_prefix = ctap_info.aaguid.hex()[:8] if ctap_info.aaguid else ""
-                    variant = self.SOLOKEYS_AAGUIDS.get(aaguid_prefix, "")
-                    if not variant and aaguid_prefix:
+                    aaguid_variant = self.SOLOKEYS_AAGUIDS.get(aaguid_prefix, "")
+                    if aaguid_variant and variant and aaguid_variant != variant:
+                        _log.warning(
+                            "connect() AAGUID variant '%s' disagrees with locked() variant '%s'",
+                            aaguid_variant,
+                            variant,
+                        )
+                    elif not aaguid_variant and aaguid_prefix:
                         _log.debug("connect() unknown AAGUID prefix=%s", aaguid_prefix)
                 except Exception as exc:
                     _log.debug("connect() CTAP2 GetInfo failed (non-fatal): %s", exc)
-                if not variant:
-                    variant = self._variant_from_locked(self._get_locked_from_hid(matched_hid))
 
                 self._hid_path = getattr(desc, "path", None)
                 self._device_uuid = device_uuid
@@ -431,7 +440,7 @@ class Solo2Device(SoloDevice):
             return "Secure"
         if locked is False:
             return "Hacker"
-        return ""
+        return "Secure"  # fail-safe: unknown → Secure (avoid bricking secure device)
 
     def _detect_capabilities(self, ctap_info=None) -> FirmwareCapabilities:
         caps = FirmwareCapabilities(
