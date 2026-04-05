@@ -300,6 +300,11 @@ class Solo2Device(SoloDevice):
         )
 
     @property
+    def variant(self) -> str:
+        """'Hacker', 'Secure', or '' if unknown."""
+        return self._variant or ""
+
+    @property
     def firmware_version(self) -> Optional[str]:
         return self._firmware_version
 

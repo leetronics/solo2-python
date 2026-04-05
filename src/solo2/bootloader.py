@@ -44,6 +44,7 @@ _RESPONSE_TAG_GENERIC = 0xA0
 _CMD_FLASH_ERASE_ALL = 0x01
 _CMD_FLASH_ERASE_REGION = 0x02
 _CMD_WRITE_MEMORY = 0x04
+_CMD_RECEIVE_SB_FILE = 0x08
 _CMD_RESET = 0x0B
 
 _FLASH_WRITE_ALIGNMENT = 512
@@ -377,6 +378,31 @@ class BootloaderSession:
                 progress_cb(written, total)
 
         self._expect_final_generic_success("WriteMemory", timeout=15000)
+
+    def receive_sb_file(self, data: bytes, progress_cb=None) -> None:
+        """Send a signed SB2.1 firmware container via the ReceiveSbFile bootloader command."""
+        if len(data) < 96:
+            raise BootloaderError(f"SB2.1 file too small: {len(data)} bytes")
+        total = len(data)
+        response = self._send_command(
+            "ReceiveSbFile",
+            _CMD_RECEIVE_SB_FILE,
+            [total],
+            has_data_phase=True,
+            timeout=10000,
+        )
+        if response.tag != _RESPONSE_TAG_GENERIC:
+            raise BootloaderError(f"ReceiveSbFile: unexpected response tag {response.tag:#04x}")
+
+        written = 0
+        for chunk in (data[off : off + _DATA_PAYLOAD_SIZE] for off in range(0, total, _DATA_PAYLOAD_SIZE)):
+            self._write_report(_REPORT_COMMAND_DATA, chunk, timeout=5000, pad_to=_DATA_PAYLOAD_SIZE)
+            written += len(chunk)
+            if progress_cb is not None:
+                progress_cb(written, total)
+
+        # Longer timeout: bootloader verifies signature + executes flash commands internally
+        self._expect_final_generic_success("ReceiveSbFile", timeout=60000)
 
     def reset(self) -> None:
         """Reset the device back into regular firmware mode."""
