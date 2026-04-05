@@ -302,7 +302,7 @@ def cmd_provisioner(args: argparse.Namespace):
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="solo2")
+    parser = argparse.ArgumentParser(prog="pysolo2")
     parser.add_argument("--device", help="descriptor id of the target device")
     parser.add_argument("--json", action="store_true", help="print JSON output")
 

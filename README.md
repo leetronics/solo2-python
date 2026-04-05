@@ -10,7 +10,7 @@ Install the package and CLI from the repo root:
 python3 -m pip install .
 ```
 
-That installs the `solo2` command defined in `pyproject.toml`.
+That installs the `pysolo2` command defined in `pyproject.toml`.
 
 For editable local development:
 
@@ -21,7 +21,7 @@ python3 -m pip install -e .
 You can then verify the CLI is available with:
 
 ```bash
-solo2 --help
+pysolo2 --help
 ```
 
 For an isolated user install, `pipx` also works:
@@ -36,17 +36,17 @@ On Linux, USB and smartcard access may additionally require system packages such
 
 Top-level commands:
 
-- `solo2 list`
+- `pysolo2 list`
   List discoverable Solo 2 devices.
-- `solo2 info`
+- `pysolo2 info`
   Show information about the selected device.
-- `solo2 admin`
+- `pysolo2 admin`
   Admin app operations such as UUID, diagnostics, reboot, and factory reset.
-- `solo2 fido2`
+- `pysolo2 fido2`
   FIDO2 PIN and credential management.
-- `solo2 secrets`
+- `pysolo2 secrets`
   Secrets/Vault operations including OTP credentials, PIN handling, and HMAC slots.
-- `solo2 provisioner`
+- `pysolo2 provisioner`
   Provisioner app operations for keys, certificates, and filesystem tasks.
 
 Global options:
@@ -59,22 +59,22 @@ Global options:
 ## Common Examples
 
 ```bash
-solo2 list
-solo2 info
-solo2 admin diagnostics
-solo2 fido2 pin-status
-solo2 fido2 list --pin 123456
-solo2 secrets status
-solo2 secrets list
-solo2 secrets hmac-status
-solo2 provisioner generate-key ed25519
+pysolo2 list
+pysolo2 info
+pysolo2 admin diagnostics
+pysolo2 fido2 pin-status
+pysolo2 fido2 list --pin 123456
+pysolo2 secrets status
+pysolo2 secrets list
+pysolo2 secrets hmac-status
+pysolo2 provisioner generate-key ed25519
 ```
 
 Use `--help` on any command group for the full subcommand list:
 
 ```bash
-solo2 admin --help
-solo2 fido2 --help
-solo2 secrets --help
-solo2 provisioner --help
+pysolo2 admin --help
+pysolo2 fido2 --help
+pysolo2 secrets --help
+pysolo2 provisioner --help
 ```

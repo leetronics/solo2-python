@@ -22,7 +22,7 @@ black = "^23.11.0"
 mypy = "^1.7.1"
 
 [tool.poetry.scripts]
-solo2 = "solo2.cli:main"
+pysolo2 = "solo2.cli:main"
 
 [build-system]
 requires = ["poetry-core"]
