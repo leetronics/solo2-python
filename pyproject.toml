@@ -2,7 +2,7 @@
 name = "solo2"
 version = "0.1.0"
 description = "Python library and CLI for Solo 2 device management"
-authors = ["SoloKeys Team"]
+authors = ["Manuel Domke <manuel@leetronics.de>"]
 license = "GPL-3.0-only"
 readme = "README.md"
 packages = [
