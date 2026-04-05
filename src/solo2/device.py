@@ -47,13 +47,13 @@ def format_firmware_full(semver: Optional[str]) -> str:
 
 
 def firmware_supports_extended_applets(semver: Optional[str]) -> bool:
-    """Return True for firmware versions that include Secrets, PIV, and OpenPGP."""
+    """Return True only for firmware versions later than 2022-08-22."""
     if not semver:
         return False
     try:
         _major, minor, _patch = (int(x) for x in semver.split("."))
         fw_date = date(2020, 1, 1) + timedelta(days=minor)
-        return fw_date >= date(2022, 8, 22)
+        return fw_date > date(2022, 8, 22)
     except Exception:
         return False
 
@@ -157,6 +157,9 @@ class Solo2Device(SoloDevice):
         "8bc54968": "Hacker",
         "2369d4d0": "Secure",
     }
+    _ADMIN_CMD_VERSION = 0x61
+    _ADMIN_CMD_UUID = 0x62
+    _ADMIN_CMD_LOCKED = 0x63
 
     def __init__(self, descriptor: Solo2Descriptor | str, mode: DeviceMode | None = None):
         if isinstance(descriptor, Solo2Descriptor):
@@ -191,6 +194,7 @@ class Solo2Device(SoloDevice):
                     connection = self.open_pcsc_connection(admin=True)
                     version = self._get_firmware_version_from_pcsc(connection)
                     device_uuid = self._get_uuid_from_pcsc(connection)
+                    locked = self._get_locked_from_pcsc(connection)
                     connection.close()
 
                     stable_id = f"uuid:{device_uuid}" if device_uuid else f"ccid:{self._reader_name or self.path}"
@@ -206,7 +210,7 @@ class Solo2Device(SoloDevice):
                     )
                     self._device_uuid = device_uuid
                     self._firmware_version = version
-                    self._variant = "Hacker"
+                    self._variant = self._variant_from_locked(locked)
                     self._capabilities = self._detect_capabilities()
                     self.status = DeviceStatus.CONNECTED
                     return True
@@ -219,15 +223,19 @@ class Solo2Device(SoloDevice):
                 desc = matched_hid.descriptor
                 version = self._get_firmware_version_from_hid(matched_hid)
                 device_uuid = self._get_uuid_from_hid(matched_hid)
-                variant = "Hacker"
+                variant = ""
                 ctap_info = None
                 try:
                     ctap = Ctap2(matched_hid)
                     ctap_info = ctap.info
                     aaguid_prefix = ctap_info.aaguid.hex()[:8] if ctap_info.aaguid else ""
-                    variant = self.SOLOKEYS_AAGUIDS.get(aaguid_prefix, "Hacker")
+                    variant = self.SOLOKEYS_AAGUIDS.get(aaguid_prefix, "")
+                    if not variant and aaguid_prefix:
+                        _log.debug("connect() unknown AAGUID prefix=%s", aaguid_prefix)
                 except Exception as exc:
                     _log.debug("connect() CTAP2 GetInfo failed (non-fatal): %s", exc)
+                if not variant:
+                    variant = self._variant_from_locked(self._get_locked_from_hid(matched_hid))
 
                 self._hid_path = getattr(desc, "path", None)
                 self._device_uuid = device_uuid
@@ -348,7 +356,7 @@ class Solo2Device(SoloDevice):
 
     def _get_firmware_version_from_hid(self, hid_device) -> Optional[str]:
         try:
-            resp = self._call_hid_command(0x61, b"", hid_device=hid_device)
+            resp = self._call_hid_command(self._ADMIN_CMD_VERSION, b"", hid_device=hid_device)
             if len(resp) < 4:
                 _log.debug(
                     "_get_firmware_version_from_hid short response path=%r len=%d",
@@ -377,7 +385,7 @@ class Solo2Device(SoloDevice):
 
     def _get_uuid_from_hid(self, hid_device) -> Optional[str]:
         try:
-            resp = self._call_hid_command(0x62, b"", hid_device=hid_device)
+            resp = self._call_hid_command(self._ADMIN_CMD_UUID, b"", hid_device=hid_device)
             if len(resp) < 16:
                 _log.debug(
                     "_get_uuid_from_hid short response path=%r len=%d",
@@ -403,6 +411,27 @@ class Solo2Device(SoloDevice):
                 exc,
             )
             return None
+
+    def _get_locked_from_hid(self, hid_device) -> Optional[bool]:
+        try:
+            resp = self._call_hid_command(self._ADMIN_CMD_LOCKED, b"", hid_device=hid_device)
+            if not resp:
+                return None
+            return resp[0] != 0
+        except Exception as exc:
+            _log.debug(
+                "_get_locked_from_hid failed path=%r err=%s",
+                getattr(getattr(hid_device, "descriptor", None), "path", None),
+                exc,
+            )
+            return None
+
+    def _variant_from_locked(self, locked: Optional[bool]) -> str:
+        if locked is True:
+            return "Secure"
+        if locked is False:
+            return "Hacker"
+        return ""
 
     def _detect_capabilities(self, ctap_info=None) -> FirmwareCapabilities:
         caps = FirmwareCapabilities(
@@ -540,7 +569,7 @@ class Solo2Device(SoloDevice):
 
     def _get_firmware_version_from_pcsc(self, connection) -> Optional[str]:
         try:
-            resp = connection.call_admin(0x61)
+            resp = connection.call_admin(self._ADMIN_CMD_VERSION)
             if len(resp) < 4:
                 return None
             version = struct.unpack(">I", resp[:4])[0]
@@ -554,7 +583,7 @@ class Solo2Device(SoloDevice):
 
     def _get_uuid_from_pcsc(self, connection) -> Optional[str]:
         try:
-            resp = connection.call_admin(0x62)
+            resp = connection.call_admin(self._ADMIN_CMD_UUID)
             if len(resp) < 16:
                 return None
             uuid_hex = resp[:16].hex()
@@ -564,6 +593,16 @@ class Solo2Device(SoloDevice):
             )
         except Exception as exc:
             _log.debug("_get_uuid_from_pcsc failed reader=%s err=%s", self._reader_name, exc)
+            return None
+
+    def _get_locked_from_pcsc(self, connection) -> Optional[bool]:
+        try:
+            resp = connection.call_admin(self._ADMIN_CMD_LOCKED)
+            if not resp:
+                return None
+            return resp[0] != 0
+        except Exception as exc:
+            _log.debug("_get_locked_from_pcsc failed reader=%s err=%s", self._reader_name, exc)
             return None
 
     def prefers_ccid(self) -> bool:
