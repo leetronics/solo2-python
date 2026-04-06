@@ -80,17 +80,21 @@ class BootloaderSession:
         deadline = time.monotonic() + max(timeout, 0.0)
         while True:
             if hid is not None:
-                for info in hid.enumerate():
-                    vid = info.get("vendor_id")
-                    pid = info.get("product_id")
-                    if (vid, pid) not in (
+                candidates = [
+                    info for info in hid.enumerate()
+                    if (info.get("vendor_id"), info.get("product_id")) in (
                         (SOLOKEYS_VID, BOOTLOADER_PID),
                         (NXP_BOOTLOADER_VID, NXP_BOOTLOADER_PID),
-                    ):
-                        continue
+                    ) and info.get("path") is not None
+                ]
+                # Prefer vendor-defined HID usage page (0xFF00/0xFFFF) — MCUBOOT uses 0xFF00.
+                # macOS may enumerate the same device under multiple usage pages; trying the
+                # wrong one causes silent read/write failures.
+                candidates.sort(
+                    key=lambda i: 0 if i.get("usage_page", 0) in (0xFF00, 0xFFFF) else 1
+                )
+                for info in candidates:
                     path = info.get("path")
-                    if path is None:
-                        continue
                     session = cls(hid_path=path)
                     try:
                         session._open()
@@ -427,15 +431,25 @@ class BootloaderSession:
         self._expect_final_generic_success("ReceiveSbFile", timeout=60000)
 
     def reset(self) -> None:
-        """Reset the device back into regular firmware mode."""
+        """Reset the device back into regular firmware mode.
+
+        MCUBOOT sends a generic success response before executing the reset.
+        We must read (or attempt to read) that response so the USB OUT→IN
+        transaction completes; otherwise the bootloader may not proceed to
+        the actual chip reset.
+        """
         try:
             self._write_report(
                 _REPORT_COMMAND,
                 self._build_command(_CMD_RESET, [], has_data_phase=False),
                 timeout=2000,
             )
+            try:
+                self._read_response_packet(timeout=1000)
+            except BootloaderError:
+                # Device reset before we could read — that is fine.
+                pass
         except BootloaderError:
-            # Disconnect is expected immediately after reset.
             pass
 
     def write_flash(self, firmware: bytes, progress_cb=None) -> None:
