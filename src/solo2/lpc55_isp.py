@@ -21,6 +21,8 @@ BOOTLOADER_PID = 0xB000
 
 CMPA_ADDRESS = 0x9E400     # Customer Manufacturing Page Area base address
 CMPA_SHA256_OFFSET = 0x60  # sha256_digest offset within the CMPA page (32 bytes)
+CMPA_SHA256_SIZE = 32
+CMPA_SIZE = 512            # CMPA page is one 512-byte flash block
 
 
 class Lpc55AccessDenied(Exception):
@@ -52,6 +54,18 @@ class _Bootloader:
             return self._session.read_memory(address, length)
         except BootloaderError as exc:
             raise Lpc55AccessDenied(str(exc)) from exc
+
+    def erase_flash(self, address: int, length: int) -> None:
+        try:
+            self._session.erase_flash(address, length)
+        except BootloaderError as exc:
+            raise Lpc55Error(str(exc)) from exc
+
+    def write_memory(self, address: int, data: bytes) -> None:
+        try:
+            self._session.write_memory(address, data)
+        except BootloaderError as exc:
+            raise Lpc55Error(str(exc)) from exc
 
     def reset(self) -> None:
         try:
@@ -112,3 +126,46 @@ def detect_variant() -> str:
         _log.debug("lpc55_isp: access allowed → Hacker (locked)")
         bl.reset()
         return "Hacker (locked)"
+
+
+def disable_secure_boot() -> None:
+    """
+    Disable Secure Boot on a Hacker (locked) device.
+
+    Reads the 512-byte CMPA page, zeroes the 32-byte SHA256 digest field at
+    offset 0x60, then erases and rewrites the page.  The bootloader uses the
+    digest to verify CMPA integrity; a zero digest means "no seal" → Secure
+    Boot disabled.
+
+    Device must be in bootloader mode (1209:b000).  Raises Lpc55Error if the
+    device is Secure (ISP read blocked) or if the write fails.  Resets the
+    device back to firmware mode on success.
+
+    If the digest is already all-zeros the page is not rewritten.
+    """
+    with _Bootloader() as bl:
+        try:
+            cmpa = bl.read_memory(CMPA_ADDRESS, CMPA_SIZE)
+        except Lpc55AccessDenied as exc:
+            raise Lpc55Error(
+                f"Cannot read CMPA — device is Secure (ISP blocked): {exc}"
+            ) from exc
+
+        digest = cmpa[CMPA_SHA256_OFFSET : CMPA_SHA256_OFFSET + CMPA_SHA256_SIZE]
+        if not any(digest):
+            _log.debug("lpc55_isp: CMPA digest already zero — already unlocked")
+            bl.reset()
+            return
+
+        cmpa_new = bytearray(cmpa)
+        cmpa_new[CMPA_SHA256_OFFSET : CMPA_SHA256_OFFSET + CMPA_SHA256_SIZE] = bytes(
+            CMPA_SHA256_SIZE
+        )
+
+        _log.debug("lpc55_isp: erasing CMPA page at 0x%X", CMPA_ADDRESS)
+        bl.erase_flash(CMPA_ADDRESS, CMPA_SIZE)
+
+        _log.debug("lpc55_isp: writing CMPA with zeroed digest")
+        bl.write_memory(CMPA_ADDRESS, bytes(cmpa_new))
+
+        bl.reset()
