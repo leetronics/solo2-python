@@ -43,6 +43,7 @@ _RESPONSE_TAG_GENERIC = 0xA0
 
 _CMD_FLASH_ERASE_ALL = 0x01
 _CMD_FLASH_ERASE_REGION = 0x02
+_TAG_READ_MEMORY = 0x03
 _CMD_WRITE_MEMORY = 0x04
 _CMD_RECEIVE_SB_FILE = 0x08
 _CMD_RESET = 0x0B
@@ -351,6 +352,27 @@ class BootloaderSession:
         )
         if response.tag != _RESPONSE_TAG_GENERIC:
             raise BootloaderError(f"FlashErase: unexpected response tag {response.tag:#04x}")
+
+    def read_memory(self, address: int, length: int) -> bytes:
+        """Read memory via MCUBOOT. Raises BootloaderError if blocked (Secure device)."""
+        cmd = self._build_command(_TAG_READ_MEMORY, [address, length], has_data_phase=False)
+        self._write_report(_REPORT_COMMAND, cmd)
+        response = self._read_response_packet()
+        if response.status != 0 or not response.has_data:
+            raise BootloaderError(
+                f"ReadMemory blocked: status=0x{response.status:08X} has_data={response.has_data}"
+            )
+        data = bytearray()
+        while len(data) < length:
+            report_id, payload = self._read_report()
+            if report_id != _REPORT_RESPONSE_DATA:
+                break
+            data.extend(payload)
+        try:
+            self._read_report(timeout=500)  # drain final generic response
+        except Exception:
+            pass
+        return bytes(data[:length])
 
     def write_memory(self, start_address: int, data: bytes, progress_cb=None) -> None:
         """Write *data* to internal flash starting at *start_address*."""
