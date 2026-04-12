@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import IntEnum
+from typing import Optional
 
 from fido2.ctap import CtapError
 
@@ -34,7 +35,7 @@ class DeviceDiagnostics:
 
     firmware_version: str = ""
     uuid: str = ""
-    is_locked: bool = False
+    is_locked: Optional[bool] = None
     ctap2_options: dict = field(default_factory=dict)
 
 
@@ -84,9 +85,11 @@ class AdminSession:
             try:
                 response = self._device.admin().call(AdminCommand.LOCKED)
                 if response:
-                    diagnostics.is_locked = response[0] != 0
+                    # Admin can confirm locked (True) but not unlocked —
+                    # firmware has no access to CMPA.  Leave None when unlocked.
+                    diagnostics.is_locked = True if response[0] != 0 else None
             except Exception:
-                diagnostics.is_locked = False
+                diagnostics.is_locked = None
         return diagnostics
 
     def wink(self) -> None:

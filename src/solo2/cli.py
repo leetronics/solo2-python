@@ -14,6 +14,7 @@ from typing import Any
 from .admin import AdminSession, RebootMode
 from .device import DeviceMode, Solo2Descriptor, Solo2Device, format_firmware_full, format_firmware_version
 from .discovery import list_bootloader_descriptors, list_regular_descriptors, open_device
+from .lpc55_isp import check_variant_with_device, detect_variant, Lpc55Error
 from .errors import (
     Solo2ConfirmationRequiredError,
     Solo2Error,
@@ -52,7 +53,6 @@ class DeviceSummary:
     transport_summary: str | None = None
     firmware_version: str | None = None
     locked: bool | None = None
-    variant: str | None = None
     path: str | None = None
     capabilities: list[str] | None = None
 
@@ -140,12 +140,6 @@ def _transport_summary(transports: set[str]) -> str:
     return "+".join(sorted(transports))
 
 
-def _locked_from_variant(variant: str | None) -> bool | None:
-    if variant == "Secure":
-        return True
-    if variant == "Hacker":
-        return False
-    return None
 
 
 def _regular_display(
@@ -212,8 +206,7 @@ def _list_device_summaries() -> list[DeviceSummary]:
                     "mode": DeviceMode.REGULAR.value,
                     "path": device.path,
                     "firmware_version": device.firmware_version,
-                    "variant": device.variant or None,
-                    "locked": _locked_from_variant(device.variant),
+                    "locked": device.is_locked,
                     "transports": set(),
                     "capabilities": set(device.get_info().capabilities or []),
                 },
@@ -225,9 +218,7 @@ def _list_device_summaries() -> list[DeviceSummary]:
                 entry["path"] = device.path
             if device.firmware_version and not entry["firmware_version"]:
                 entry["firmware_version"] = device.firmware_version
-            if device.variant and not entry["variant"]:
-                entry["variant"] = device.variant
-            locked = _locked_from_variant(device.variant)
+            locked = device.is_locked
             if locked is not None and entry["locked"] is None:
                 entry["locked"] = locked
             entry["capabilities"].update(device.get_info().capabilities or [])
@@ -251,7 +242,6 @@ def _list_device_summaries() -> list[DeviceSummary]:
             transport_summary=_transport_summary(entry["transports"]),
             firmware_version=entry["firmware_version"],
             locked=entry["locked"],
-            variant=entry["variant"],
             path=entry["path"],
             capabilities=sorted(entry["capabilities"]) or None,
         )
@@ -345,7 +335,7 @@ def cmd_info(args: argparse.Namespace):
         None,
     )
     transports = set(inventory_summary.transports or []) if inventory_summary else {_transport_label(device.descriptor.transport)}
-    locked = inventory_summary.locked if inventory_summary else _locked_from_variant(device.variant)
+    locked = inventory_summary.locked if inventory_summary else device.is_locked
     summary = _regular_display(
         uuid=device.device_uuid,
         transports=transports,
@@ -359,7 +349,6 @@ def cmd_info(args: argparse.Namespace):
         path=info.path,
         mode=info.mode.value,
         uuid=device.device_uuid,
-        variant=device.variant or None,
         transport_summary=_transport_summary(transports),
         transports=sorted(transports),
         firmware_version=device.firmware_version,
@@ -369,8 +358,6 @@ def cmd_info(args: argparse.Namespace):
         capabilities=info.capabilities,
     )
     human = [summary]
-    if data.get("variant"):
-        human.append(f"variant: {data['variant']}")
     human.append(f"id: {data['id']}")
     human.append(f"path: {data['path']}")
     if data.get("capabilities"):
@@ -566,6 +553,39 @@ def cmd_provisioner(args: argparse.Namespace):
     raise Solo2Error(f"Unknown provisioner command: {args.provisioner_cmd}")
 
 
+def cmd_check_variant(args: argparse.Namespace):
+    """Detect hardware variant via MCUBOOT ISP (CMPA read)."""
+    def _progress(pct: int, msg: str) -> None:
+        print(f"  [{pct:3d}%] {msg}", file=sys.stderr)
+
+    # Try to find a regular-mode device to reboot first; fall back to ISP-only
+    # if the device is already in bootloader mode.
+    device = None
+    try:
+        device = _select_device(getattr(args, "device", None))
+    except Solo2Error:
+        pass
+
+    try:
+        if device is not None:
+            result = check_variant_with_device(device, progress_cb=_progress)
+            locked = device.is_locked
+        else:
+            # Device is already in bootloader mode — run ISP probe directly.
+            _progress(60, "Probing CMPA via ISP…")
+            result = detect_variant()
+            _progress(100, "Done")
+            locked = result != "Hacker (unlocked)"
+    except Lpc55Error as exc:
+        raise Solo2Error(str(exc)) from exc
+
+    lock_label = {True: "locked", False: "unlocked", None: "unknown"}[locked]
+    return CliResult(
+        human=f"{result} ({lock_label})",
+        data={"variant": result, "locked": locked},
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pysolo2")
     parser.add_argument("--device", help="descriptor id of the target device")
@@ -578,6 +598,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     info_parser = subparsers.add_parser("info", help="show device information")
     info_parser.set_defaults(func=cmd_info)
+
+    variant_parser = subparsers.add_parser(
+        "check-variant",
+        help="detect Hacker/Secure variant via hardware ISP (CMPA read)",
+    )
+    variant_parser.set_defaults(func=cmd_check_variant)
 
     admin_parser = subparsers.add_parser("admin", help="admin app operations")
     admin_sub = admin_parser.add_subparsers(dest="admin_cmd", required=True)

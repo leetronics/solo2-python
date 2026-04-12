@@ -107,7 +107,7 @@ class FirmwareCapabilities:
     ctap2_up: bool = False
     has_piv: bool = False
     has_openpgp: bool = False
-    variant: str = ""
+    is_locked: Optional[bool] = None
     firmware_version: Optional[str] = None
 
 
@@ -153,10 +153,6 @@ class Solo2Device(SoloDevice):
     SOLOKEYS_VID = 0x1209
     REGULAR_PID = 0xBEEE
     BOOTLOADER_PID = 0xB000
-    SOLOKEYS_AAGUIDS = {
-        "8bc54968": "Hacker",
-        "2369d4d0": "Secure",
-    }
     _ADMIN_CMD_VERSION = 0x61
     _ADMIN_CMD_UUID = 0x62
     _ADMIN_CMD_LOCKED = 0x63
@@ -177,7 +173,7 @@ class Solo2Device(SoloDevice):
         super().__init__(resolved)
         self._usb_device: Optional[usb.core.Device] = None
         self._hid_path = resolved.hid_path
-        self._variant: Optional[str] = None
+        self._locked: Optional[bool] = None
         self._firmware_version: Optional[str] = resolved.firmware_version
         self._capabilities: Optional[FirmwareCapabilities] = None
         self._device_uuid: Optional[str] = resolved.uuid
@@ -210,7 +206,7 @@ class Solo2Device(SoloDevice):
                     )
                     self._device_uuid = device_uuid
                     self._firmware_version = version
-                    self._variant = self._variant_from_locked(locked)
+                    self._locked = locked
                     self._capabilities = self._detect_capabilities()
                     self.status = DeviceStatus.CONNECTED
                     return True
@@ -225,24 +221,12 @@ class Solo2Device(SoloDevice):
                 device_uuid = self._get_uuid_from_hid(matched_hid)
                 ctap_info = None
 
-                # locked() reads the hardware Secure Boot seal — always reliable
                 locked = self._get_locked_from_hid(matched_hid)
-                variant = self._variant_from_locked(locked)
 
-                # AAGUID only for cross-check (requires provisioned attestation cert)
+                ctap_info = None
                 try:
                     ctap = Ctap2(matched_hid)
                     ctap_info = ctap.info
-                    aaguid_prefix = ctap_info.aaguid.hex()[:8] if ctap_info.aaguid else ""
-                    aaguid_variant = self.SOLOKEYS_AAGUIDS.get(aaguid_prefix, "")
-                    if aaguid_variant and variant and aaguid_variant != variant:
-                        _log.warning(
-                            "connect() AAGUID variant '%s' disagrees with locked() variant '%s'",
-                            aaguid_variant,
-                            variant,
-                        )
-                    elif not aaguid_variant and aaguid_prefix:
-                        _log.debug("connect() unknown AAGUID prefix=%s", aaguid_prefix)
                 except Exception as exc:
                     _log.debug("connect() CTAP2 GetInfo failed (non-fatal): %s", exc)
 
@@ -264,7 +248,7 @@ class Solo2Device(SoloDevice):
                     firmware_version=version,
                     uuid=device_uuid,
                 )
-                self._variant = variant
+                self._locked = locked
                 self._firmware_version = version
                 self._capabilities = self._detect_capabilities(ctap_info=ctap_info)
                 self.status = DeviceStatus.CONNECTED
@@ -297,7 +281,7 @@ class Solo2Device(SoloDevice):
         if self.mode == DeviceMode.BOOTLOADER:
             return DeviceInfo(path=self.path, mode=self.mode, firmware_version="Bootloader")
 
-        product = f"Solo 2 {self._variant}" if self._variant else "Solo 2"
+        product = "Solo 2"
         capabilities = None
         if self._capabilities:
             capabilities = [
@@ -317,9 +301,9 @@ class Solo2Device(SoloDevice):
         )
 
     @property
-    def variant(self) -> str:
-        """'Hacker', 'Secure', or '' if unknown."""
-        return self._variant or ""
+    def is_locked(self) -> Optional[bool]:
+        """True if locked (Secure Boot active), False if unlocked, None if unknown."""
+        return self._locked
 
     @property
     def firmware_version(self) -> Optional[str]:
@@ -426,7 +410,12 @@ class Solo2Device(SoloDevice):
             resp = self._call_hid_command(self._ADMIN_CMD_LOCKED, b"", hid_device=hid_device)
             if not resp:
                 return None
-            return resp[0] != 0
+            # Admin command can confirm locked (True) but cannot confirm unlocked:
+            # the firmware has no access to the LPC55 PFR/CMPA page so it cannot
+            # detect whether Secure Boot is active.  Return None (unknown) when the
+            # admin reports unlocked; only an ISP probe via detect_variant() can
+            # confirm the unlocked state.
+            return True if resp[0] != 0 else None
         except Exception as exc:
             _log.debug(
                 "_get_locked_from_hid failed path=%r err=%s",
@@ -435,16 +424,9 @@ class Solo2Device(SoloDevice):
             )
             return None
 
-    def _variant_from_locked(self, locked: Optional[bool]) -> str:
-        if locked is True:
-            return "Secure"
-        if locked is False:
-            return "Hacker"
-        return "Secure"  # fail-safe: unknown → Secure (avoid bricking secure device)
-
     def _detect_capabilities(self, ctap_info=None) -> FirmwareCapabilities:
         caps = FirmwareCapabilities(
-            variant=self._variant or "",
+            is_locked=self._locked,
             firmware_version=self._firmware_version,
         )
         if self._firmware_version is not None:
@@ -463,7 +445,7 @@ class Solo2Device(SoloDevice):
             extensions = getattr(ctap_info, "extensions", []) or []
             if "piv" in extensions:
                 caps.has_piv = True
-        if self._variant in ("Hacker", "Secure"):
+        if self._locked is not None:
             caps.has_piv = True
             caps.has_openpgp = True
         return caps
@@ -609,10 +591,14 @@ class Solo2Device(SoloDevice):
             resp = connection.call_admin(self._ADMIN_CMD_LOCKED)
             if not resp:
                 return None
-            return resp[0] != 0
+            return True if resp[0] != 0 else None
         except Exception as exc:
             _log.debug("_get_locked_from_pcsc failed reader=%s err=%s", self._reader_name, exc)
             return None
+
+    def confirm_lock_status(self, locked: bool) -> None:
+        """Update the cached lock status with a hardware-confirmed result (ISP probe)."""
+        self._locked = locked
 
     def prefers_ccid(self) -> bool:
         return self._descriptor.transport == "ccid"

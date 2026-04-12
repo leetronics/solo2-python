@@ -17,14 +17,11 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-import usb.core
-import usb.util
-
 from .device import Solo2Device
 
 try:
     import hid
-except Exception:  # pragma: no cover - optional dependency on some platforms
+except Exception:  # pragma: no cover
     hid = None
 
 SOLOKEYS_VID = Solo2Device.SOLOKEYS_VID
@@ -66,53 +63,41 @@ class _ResponsePacket:
 class BootloaderSession:
     """Synchronous session with a Solo 2 device in ROM bootloader mode."""
 
-    def __init__(self, usb_device: Optional[usb.core.Device] = None, *, hid_path: object = None):
-        self._dev = usb_device
+    def __init__(self, *, hid_path: object):
         self._hid_path = hid_path
         self._hid_dev = None
-        self._ep_out: Optional[usb.core.Endpoint] = None
-        self._ep_in: Optional[usb.core.Endpoint] = None
-        self._claimed_interface = False
 
     @classmethod
     def find(cls, timeout: float = 0.0) -> "BootloaderSession":
         """Return a session for the first bootloader device found."""
+        if hid is None:
+            raise BootloaderError(
+                "hidapi is not installed. Install it with: pip install hidapi"
+            )
         deadline = time.monotonic() + max(timeout, 0.0)
         while True:
-            if hid is not None:
-                candidates = [
-                    info for info in hid.enumerate()
-                    if (info.get("vendor_id"), info.get("product_id")) in (
-                        (SOLOKEYS_VID, BOOTLOADER_PID),
-                        (NXP_BOOTLOADER_VID, NXP_BOOTLOADER_PID),
-                    ) and info.get("path") is not None
-                ]
-                # Prefer vendor-defined HID usage page (0xFF00/0xFFFF) — MCUBOOT uses 0xFF00.
-                # macOS may enumerate the same device under multiple usage pages; trying the
-                # wrong one causes silent read/write failures.
-                candidates.sort(
-                    key=lambda i: 0 if i.get("usage_page", 0) in (0xFF00, 0xFFFF) else 1
-                )
-                for info in candidates:
-                    path = info.get("path")
-                    session = cls(hid_path=path)
-                    try:
-                        session._open()
-                        return session
-                    except Exception:
-                        session.close()
-                        continue
-
-            dev = usb.core.find(idVendor=SOLOKEYS_VID, idProduct=BOOTLOADER_PID)
-            if dev is None:
-                dev = usb.core.find(idVendor=NXP_BOOTLOADER_VID, idProduct=NXP_BOOTLOADER_PID)
-            if dev is not None:
-                session = cls(dev)
+            candidates = [
+                info for info in hid.enumerate()
+                if (info.get("vendor_id"), info.get("product_id")) in (
+                    (SOLOKEYS_VID, BOOTLOADER_PID),
+                    (NXP_BOOTLOADER_VID, NXP_BOOTLOADER_PID),
+                ) and info.get("path") is not None
+            ]
+            # Prefer vendor-defined HID usage page (0xFF00/0xFFFF) — MCUBOOT uses 0xFF00.
+            # macOS may enumerate the same device under multiple usage pages; trying the
+            # wrong one causes silent read/write failures.
+            candidates.sort(
+                key=lambda i: 0 if i.get("usage_page", 0) in (0xFF00, 0xFFFF) else 1
+            )
+            for info in candidates:
+                path = info.get("path")
+                session = cls(hid_path=path)
                 try:
                     session._open()
                     return session
                 except Exception:
                     session.close()
+                    continue
             if time.monotonic() >= deadline:
                 raise BootloaderError("No Solo 2 bootloader device found")
             time.sleep(0.4)
@@ -124,50 +109,18 @@ class BootloaderSession:
         self.close()
 
     def _open(self) -> None:
-        if self._hid_path is not None:
-            if hid is None:
-                raise BootloaderError("hid transport is not available")
-            dev = hid.device()
-            try:
-                dev.open_path(self._hid_path)
-            except Exception as exc:
-                raise BootloaderError(f"Could not open bootloader HID path: {exc}") from exc
-            try:
-                dev.set_nonblocking(False)
-            except Exception:
-                pass
-            self._hid_dev = dev
-            return
-
-        dev = self._dev
-        if dev is None:
-            raise BootloaderError("No bootloader device selected")
+        if hid is None:
+            raise BootloaderError("hidapi is not installed. Install it with: pip install hidapi")
+        dev = hid.device()
         try:
-            if dev.is_kernel_driver_active(0):
-                dev.detach_kernel_driver(0)
+            dev.open_path(self._hid_path)
+        except Exception as exc:
+            raise BootloaderError(f"Could not open bootloader HID path: {exc}") from exc
+        try:
+            dev.set_nonblocking(False)
         except Exception:
             pass
-        try:
-            dev.set_configuration()
-        except usb.core.USBError:
-            pass
-
-        intf = dev.get_active_configuration()[(0, 0)]
-        usb.util.claim_interface(dev, 0)
-        self._claimed_interface = True
-
-        self._ep_out = usb.util.find_descriptor(
-            intf,
-            custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress)
-            == usb.util.ENDPOINT_OUT,
-        )
-        self._ep_in = usb.util.find_descriptor(
-            intf,
-            custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress)
-            == usb.util.ENDPOINT_IN,
-        )
-        if not self._ep_out or not self._ep_in:
-            raise BootloaderError("Could not find USB endpoints on bootloader device")
+        self._hid_dev = dev
 
     def close(self) -> None:
         if self._hid_dev is not None:
@@ -177,22 +130,6 @@ class BootloaderSession:
                 pass
             finally:
                 self._hid_dev = None
-        try:
-            if self._claimed_interface:
-                usb.util.release_interface(self._dev, 0)
-        except Exception:
-            pass
-        finally:
-            self._claimed_interface = False
-            try:
-                usb.util.dispose_resources(self._dev)
-            except Exception:
-                pass
-
-    def _wrap_usb_error(self, exc: usb.core.USBError, context: str) -> BootloaderError:
-        if getattr(exc, "errno", None) == 110:
-            return BootloaderError(f"{context} timed out")
-        return BootloaderError(f"{context}: {exc}")
 
     def _write_report(
         self,
@@ -202,51 +139,31 @@ class BootloaderSession:
         timeout: int = 5000,
         pad_to: Optional[int] = None,
     ) -> None:
-        if self._hid_dev is not None:
-            packet = bytearray([report_id, 0x00, len(payload) & 0xFF, (len(payload) >> 8) & 0xFF])
-            packet.extend(payload)
-            if pad_to is not None:
-                packet.extend(b"\x00" * max(0, pad_to - len(payload)))
-            try:
-                written = self._hid_dev.write(bytes(packet))
-            except Exception as exc:
-                raise BootloaderError(f"Bootloader write: {exc}") from exc
-            if written < len(packet):
-                raise BootloaderError(f"Bootloader short write: sent {written}/{len(packet)} bytes")
-            return
-
-        if self._ep_out is None:
+        if self._hid_dev is None:
             raise BootloaderError("Bootloader transport is not open")
-
         packet = bytearray([report_id, 0x00, len(payload) & 0xFF, (len(payload) >> 8) & 0xFF])
         packet.extend(payload)
         if pad_to is not None:
             packet.extend(b"\x00" * max(0, pad_to - len(payload)))
         try:
-            written = self._ep_out.write(bytes(packet), timeout=timeout)
-        except usb.core.USBError as exc:
-            raise self._wrap_usb_error(exc, "Bootloader write") from exc
+            written = self._hid_dev.write(bytes(packet))
+        except Exception as exc:
+            raise BootloaderError(f"Bootloader write: {exc}") from exc
+        if written < 0:
+            raise BootloaderError(f"Bootloader write failed (hid returned {written})")
         if written < len(packet):
             raise BootloaderError(f"Bootloader short write: sent {written}/{len(packet)} bytes")
 
     def _read_report(self, *, timeout: int = 5000) -> tuple[int, bytes]:
-        if self._hid_dev is not None:
-            try:
-                raw = self._hid_dev.read(256, timeout)
-            except Exception as exc:
-                raise BootloaderError(f"Bootloader read: {exc}") from exc
-            if not raw:
-                raise BootloaderError("Bootloader read timed out")
-            raw = bytes(raw)
-        else:
-            if self._ep_in is None:
-                raise BootloaderError("Bootloader transport is not open")
-
-            packet_size = max(int(getattr(self._ep_in, "wMaxPacketSize", 64) or 64), 64)
-            try:
-                raw = bytes(self._ep_in.read(packet_size, timeout=timeout))
-            except usb.core.USBError as exc:
-                raise self._wrap_usb_error(exc, "Bootloader read") from exc
+        if self._hid_dev is None:
+            raise BootloaderError("Bootloader transport is not open")
+        try:
+            raw = self._hid_dev.read(256, timeout)
+        except Exception as exc:
+            raise BootloaderError(f"Bootloader read: {exc}") from exc
+        if not raw:
+            raise BootloaderError("Bootloader read timed out")
+        raw = bytes(raw)
 
         if len(raw) < 4:
             raise BootloaderError(f"Short bootloader report: {raw.hex()}")
@@ -362,13 +279,18 @@ class BootloaderSession:
         cmd = self._build_command(_TAG_READ_MEMORY, [address, length], has_data_phase=False)
         self._write_report(_REPORT_COMMAND, cmd)
         response = self._read_response_packet()
-        if response.status != 0 or not response.has_data:
+        if response.status != 0:
             raise BootloaderError(
-                f"ReadMemory blocked: status=0x{response.status:08X} has_data={response.has_data}"
+                f"ReadMemory blocked: status=0x{response.status:08X}"
             )
+        # has_data flag is informational — some NXP LPC55 ROM versions set it to
+        # 0 even for successful reads, so collect data packets unconditionally.
         data = bytearray()
         while len(data) < length:
-            report_id, payload = self._read_report()
+            try:
+                report_id, payload = self._read_report(timeout=3000)
+            except BootloaderError:
+                break
             if report_id != _REPORT_RESPONSE_DATA:
                 break
             data.extend(payload)
@@ -376,6 +298,10 @@ class BootloaderSession:
             self._read_report(timeout=500)  # drain final generic response
         except Exception:
             pass
+        if len(data) < length:
+            raise BootloaderError(
+                f"ReadMemory incomplete: expected {length} bytes, got {len(data)}"
+            )
         return bytes(data[:length])
 
     def write_memory(self, start_address: int, data: bytes, progress_cb=None) -> None:
@@ -452,13 +378,27 @@ class BootloaderSession:
         except BootloaderError:
             pass
 
-    def write_flash(self, firmware: bytes, progress_cb=None) -> None:
-        """Erase all flash and write a raw firmware binary."""
+    def write_flash(self, firmware: bytes, progress_cb=None, erase_progress_cb=None) -> None:
+        """Erase all flash and write a raw firmware binary.
+
+        *erase_progress_cb*, if given, is called as ``cb(erased_bytes, total_bytes)``
+        after each 32 KB chunk is erased, allowing the caller to report incremental
+        erase progress before the write phase starts.
+        """
         if len(firmware) < 1024 or len(firmware) > 512 * 1024:
             raise BootloaderError(f"Unexpected firmware size: {len(firmware)} bytes")
         padded = bytearray(firmware)
         overshoot = len(padded) % _FLASH_WRITE_ALIGNMENT
         if overshoot:
             padded.extend(b"\x00" * (_FLASH_WRITE_ALIGNMENT - overshoot))
-        self.erase_flash(0x00000000, len(padded))
+        total = len(padded)
+        # Erase in 32 KB chunks so the caller can report erase progress.
+        _ERASE_CHUNK = 32 * 1024
+        erased = 0
+        while erased < total:
+            chunk = min(_ERASE_CHUNK, total - erased)
+            self.erase_flash(erased, chunk)
+            erased += chunk
+            if erase_progress_cb is not None:
+                erase_progress_cb(min(erased, total), total)
         self.write_memory(0x00000000, bytes(padded), progress_cb=progress_cb)
