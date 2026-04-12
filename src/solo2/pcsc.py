@@ -10,6 +10,8 @@ from typing import Optional
 
 _log = logging.getLogger("solo2device")
 
+PCSC_IMPORT_ERROR = ""
+
 try:
     from smartcard.System import readers
     from smartcard.Exceptions import CardConnectionException, NoCardException
@@ -22,6 +24,7 @@ except ImportError as exc:  # pragma: no cover - depends on platform packaging
     NoCardException = Exception
     _CardConnection = None
     PCSC_AVAILABLE = False
+    PCSC_IMPORT_ERROR = str(exc)
     _log.debug("PCSC import failed: %s", exc)
 
 
@@ -125,6 +128,11 @@ class Solo2PcscConnection:
             payload, sw1, sw2 = self._transmit_all(apdu)
         return payload, sw1, sw2
 
+    def transmit(self, apdu: list) -> tuple:
+        """Send a raw APDU (as a list of ints) and return (response_list, sw1, sw2)."""
+        data, sw1, sw2 = self._transmit(bytes(apdu))
+        return list(data), sw1, sw2
+
     def call_secrets(self, apdu: bytes) -> bytes:
         payload, sw1, sw2 = self._transmit_selected(SECRETS_AID, apdu)
         return bytes([sw1, sw2]) + payload
@@ -187,6 +195,26 @@ def list_pcsc_descriptors() -> list[PcscDescriptor]:
         finally:
             connection.close()
     return descriptors
+
+
+def iter_pcsc_connections():
+    """Yield a connected Solo2PcscConnection for each available PCSC reader.
+
+    Handles protocol selection (T=1 preferred, then auto) internally.
+    Callers are responsible for calling connection.close() when done,
+    unless they keep the connection open intentionally.
+    """
+    yield from _iter_connections()
+
+
+def list_pcsc_reader_names() -> list:
+    """Return the names of all currently visible PCSC readers as strings."""
+    if not PCSC_AVAILABLE:
+        return []
+    try:
+        return [str(r) for r in readers()]
+    except Exception:
+        return []
 
 
 def open_pcsc_connection(*, secrets: bool = False, admin: bool = False) -> Solo2PcscConnection:
