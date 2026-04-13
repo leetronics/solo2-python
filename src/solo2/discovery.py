@@ -154,6 +154,31 @@ def open_bootloader(descriptor_or_id: Solo2Descriptor | str) -> Solo2Device:
     return device
 
 
+def list_presence_ids() -> set[str]:
+    """Return device IDs for all SoloKeys devices currently plugged in.
+
+    Uses hidapi's ``hid.enumerate()`` which reads VID/PID/path via the OS
+    device-info APIs (SetupAPI on Windows, sysfs on Linux) **without opening
+    a data connection**.  Safe to call at high frequency even while a CTAP
+    session is active on the same device.
+    """
+    ids: set[str] = set()
+    try:
+        import hid as _hid
+
+        for info in _hid.enumerate(Solo2Device.SOLOKEYS_VID, Solo2Device.REGULAR_PID):
+            path = info.get("path")
+            if path:
+                ids.add(f"hid:{path!r}")
+        for info in _hid.enumerate(Solo2Device.SOLOKEYS_VID, Solo2Device.BOOTLOADER_PID):
+            path = info.get("path")
+            if path:
+                ids.add(f"bl:{path!r}")
+    except Exception as exc:
+        _log.debug("list_presence_ids failed: %s", exc)
+    return ids
+
+
 @dataclass
 class DeviceSnapshot:
     """Snapshot of discovered devices keyed by their stable id."""
