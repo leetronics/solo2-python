@@ -714,6 +714,7 @@ class SecretsSession:
         login: str | None = None,
         password: str | None = None,
         metadata: str | None = None,
+        touch_required: bool | None = None,
     ) -> None:
         payload = bytearray()
         payload.extend(self._build_tlv(SecretsAppProtocol.TAG_NAME, credential.id))
@@ -730,6 +731,13 @@ class SecretsSession:
             payload.extend(self._build_tlv(SecretsAppProtocol.TAG_PWS_PASSWORD, password.encode("utf-8")))
         if metadata is not None:
             payload.extend(self._build_tlv(SecretsAppProtocol.TAG_PWS_METADATA, metadata.encode("utf-8")))
+        if touch_required is not None:
+            properties = 0
+            if touch_required:
+                properties |= SecretsAppProtocol.PROP_TOUCH_REQUIRED
+            if credential.protected:
+                properties |= SecretsAppProtocol.PROP_PIN_ENCRYPTED
+            payload.extend(self._build_tlv(SecretsAppProtocol.TAG_PROPERTY, bytes([properties])))
         self._send_apdu(SecretsAppProtocol.INS_UPDATE_CREDENTIAL, data=bytes(payload))
 
     def verify_reverse_hotp(self, credential: Credential, code: str) -> None:
@@ -926,6 +934,7 @@ class OATHBridge:
         login: str | None = None,
         password: str | None = None,
         metadata: str | None = None,
+        touch_required: bool | None = None,
     ) -> dict:
         try:
             credential = self._session.get_credential(name)
@@ -935,6 +944,7 @@ class OATHBridge:
                 login=login,
                 password=password,
                 metadata=metadata,
+                touch_required=touch_required,
             )
             return {"success": True}
         except Solo2TouchRequiredError:
