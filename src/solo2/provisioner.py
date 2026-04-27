@@ -21,6 +21,7 @@ except ImportError:
 
 PROVISION_AID = [0xA0, 0x00, 0x00, 0x08, 0x47, 0x01, 0x00, 0x00, 0x01]
 INS_SELECT = 0xA4
+INS_WRITE_BINARY = 0xD0
 INS_GEN_ED25519 = 0xBB
 INS_GEN_P256 = 0xBC
 INS_GEN_X25519 = 0xB7
@@ -30,6 +31,10 @@ INS_STORE_X25519_CERT = 0xB6
 INS_STORE_T1_PUBKEY = 0xB5
 INS_REFORMAT_FS = 0xBD
 INS_WRITE_FILE = 0xBF
+
+# Buffer IDs for the provisioner's stateful SELECT protocol
+TESTER_FILENAME_ID = [0xE1, 0x01]
+TESTER_FILE_ID = [0xE1, 0x02]
 
 KEY_TYPES = {
     "ed25519": (INS_GEN_ED25519, INS_STORE_ED25519_CERT, 32),
@@ -49,7 +54,7 @@ class GeneratedKey:
 class ProvisionerSession:
     """Synchronous provisioner session via PC/SC."""
 
-    def __init__(self, device: Solo2Device):
+    def __init__(self, device: Solo2Device | None = None):
         self._device = device
         self._connection = None
 
@@ -106,13 +111,17 @@ class ProvisionerSession:
                 pass
             self._connection = None
 
-    def _send_apdu(
-        self, ins: int, p1: int = 0, p2: int = 0, data: bytes = b""
-    ) -> bytes:
+    def _ensure_connected(self) -> None:
         if self._connection is None:
             self._connect_pcsc()
         if self._connection is None:
             raise Solo2TransportError("Provisioner not connected")
+
+    def _send_apdu(
+        self, ins: int, p1: int = 0, p2: int = 0, data: bytes = b""
+    ) -> bytes:
+        """Send a short APDU (data <= 255 bytes). For larger payloads use _send_apdu_extended."""
+        self._ensure_connected()
 
         apdu = [0x00, ins, p1, p2]
         if data:
@@ -124,6 +133,55 @@ class ProvisionerSession:
         if sw1 == 0x90 and sw2 == 0x00:
             return bytes(response)
         raise Solo2CommandError(f"APDU failed: {sw1:02X}{sw2:02X}")
+
+    def _send_apdu_extended(
+        self, ins: int, p1: int = 0, p2: int = 0, data: bytes = b""
+    ) -> bytes:
+        """Send an extended-length APDU (data up to 65535 bytes)."""
+        self._ensure_connected()
+
+        apdu = [0x00, ins, p1, p2]
+        if data:
+            if len(data) <= 255:
+                apdu.append(len(data))
+            else:
+                # Extended Lc: 0x00 followed by 2-byte big-endian length
+                apdu.append(0x00)
+                apdu.append((len(data) >> 8) & 0xFF)
+                apdu.append(len(data) & 0xFF)
+            apdu.extend(data)
+        # Extended Le: 0x0000
+        apdu.extend([0x00, 0x00])
+
+        response, sw1, sw2 = self._connection.transmit(apdu)
+        if sw1 == 0x90 and sw2 == 0x00:
+            return bytes(response)
+        raise Solo2CommandError(f"APDU failed: {sw1:02X}{sw2:02X}")
+
+    def _select_buffer(self, buffer_id: list[int]) -> None:
+        """SELECT a provisioner buffer by file ID (e.g. TESTER_FILENAME_ID).
+
+        Uses p1=0x00 (select by file ID) so the APDU is forwarded to the
+        already-selected provisioner app.  p1=0x04 would be "select by AID"
+        and would be intercepted by apdu-dispatch, causing 6A82.
+        """
+        self._send_apdu(INS_SELECT, p1=0x00, p2=0x00, data=bytes(buffer_id))
+
+    def _write_binary(self, data: bytes, chunk_size: int = 250) -> None:
+        """Write data to the currently selected buffer via WriteBinary commands.
+
+        Data is sent in chunks to stay within APDU size limits. The provisioner
+        firmware accumulates WriteBinary payloads in its active buffer (up to
+        128 bytes for filename, 8192 bytes for file contents).
+        """
+        offset = 0
+        while offset < len(data):
+            chunk = data[offset : offset + chunk_size]
+            if len(chunk) <= 255:
+                self._send_apdu(INS_WRITE_BINARY, data=chunk)
+            else:
+                self._send_apdu_extended(INS_WRITE_BINARY, data=chunk)
+            offset += len(chunk)
 
     def generate_key(self, key_type: str) -> GeneratedKey:
         info = KEY_TYPES.get(key_type)
@@ -161,11 +219,31 @@ class ProvisionerSession:
             self.close()
 
     def write_file(self, path: str, data: bytes) -> None:
+        """Write a file to the device filesystem using the buffered protocol.
+
+        Protocol:
+        1. SELECT filename buffer (0xE1 0x01)
+        2. WriteBinary: send path bytes
+        3. SELECT file contents buffer (0xE1 0x02)
+        4. WriteBinary: send file data (chunked if needed)
+        5. WriteFile (0xBF): commit — writes accumulated data to path, clears buffers
+        """
         path_bytes = path.encode("utf-8")
-        if len(path_bytes) > 255:
-            raise Solo2CommandError("File path too long")
-        payload = bytes([len(path_bytes)]) + path_bytes + data
+        if len(path_bytes) > 128:
+            raise Solo2CommandError("File path too long (max 128 bytes)")
+        if len(data) > 8192:
+            raise Solo2CommandError("File data too large (max 8192 bytes)")
+
         try:
-            self._send_apdu(INS_WRITE_FILE, data=payload)
+            # 1. Select filename buffer and write path
+            self._select_buffer(TESTER_FILENAME_ID)
+            self._write_binary(path_bytes)
+
+            # 2. Select file contents buffer and write data
+            self._select_buffer(TESTER_FILE_ID)
+            self._write_binary(data)
+
+            # 3. Commit: WriteFile with no data
+            self._send_apdu(INS_WRITE_FILE)
         finally:
             self.close()
